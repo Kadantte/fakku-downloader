@@ -3,10 +3,10 @@ import { parse } from "node-html-parser";
 import puppeteer from "puppeteer-extra";
 import stealthPlugin from "puppeteer-extra-plugin-stealth";
 import { RequestInterceptionManager } from "puppeteer-intercept-and-modify-requests";
-import sharp from "sharp";
 import { parseArgs } from "util";
 import yaml from "yaml";
-import { isUnlimited, random } from "./utils";
+import descramble from "./descrambler";
+import { descrambleImages, isUnlimited, random } from "./utils";
 
 puppeteer.use(stealthPlugin());
 
@@ -25,13 +25,16 @@ export interface Metadata {
   ThumbnailIndex?: number;
 }
 
-interface PageData {
+export interface PageData {
   pages: {
     [key: string]: {
       page: number;
+      image: string;
     };
   };
   spreads: [number, number][];
+  key_hash: string;
+  key_data: string;
 }
 
 const { values, positionals } = parseArgs({
@@ -270,9 +273,6 @@ const downloadGallery = async (slug: string) => {
   }
 
   const metadata = await getMetadata(slug);
-
-  await tab.setViewport({ width: 3840, height: 2160 });
-
   const client = await tab.createCDPSession();
 
   // @ts-ignore
@@ -282,7 +282,10 @@ const downloadGallery = async (slug: string) => {
     `Intercepting requests for page data with a timeout of ${values.timeout}ms`
   );
 
-  const pageData = await new Promise<PageData>(async (resolve, reject) => {
+  const { pageData, zid } = await new Promise<{
+    pageData: PageData;
+    zid: string;
+  }>(async (resolve, reject) => {
     const timeout = setTimeout(
       () => reject(`Failed to get page data`),
       parseInt(values.timeout!)
@@ -291,10 +294,13 @@ const downloadGallery = async (slug: string) => {
     await interceptManager.intercept({
       urlPattern: `*/read`,
       resourceType: "XHR",
-      modifyResponse({ body }) {
+      modifyResponse({ body, event }) {
         if (body) {
           clearTimeout(timeout);
-          resolve(JSON.parse(body));
+          resolve({
+            pageData: JSON.parse(body),
+            zid: event.request.headers["Cookie"].match(/fakku_zid=([^;]+)/)![1],
+          });
         }
 
         return { body };
@@ -309,151 +315,67 @@ const downloadGallery = async (slug: string) => {
     ]);
   });
 
-  console.debug("Intercepted page data body", pageData);
+  console.debug("Intercepted page data body", pageData, zid);
 
-  const pages: { page: number; url: string }[] = [];
+  await Bun.write(
+    `${downloadDir}/${slug}/scrambled/data.json`,
+    JSON.stringify(pageData, null, 2)
+  );
+
+  const pageMappings = descramble(zid, pageData);
+
+  await Bun.write(
+    `${downloadDir}/${slug}/scrambled/mappings.json`,
+    JSON.stringify(pageMappings, null, 2)
+  );
 
   console.debug("Downloading pages");
 
-  for (const [_, { page }] of Object.entries(pageData.pages)) {
-    const path = `${downloadDir}/${slug}/${page}.png`;
+  let savedPages = 0;
 
-    if (await Bun.file(path).exists()) {
-      console.debug(`Page ${page} already exists`);
+  const downloadedImages = [];
 
-      await new Promise<void>((r) =>
-        setTimeout(
-          () =>
-            tab
-              .evaluate(async () => {
-                const random = (min: number, max: number) => {
-                  min = Math.ceil(min);
-                  max = Math.floor(max);
+  for (const { page, image, filename } of Object.values(pageMappings)) {
+    console.debug(`Downloading page ${page} ${filename} - ${image}`);
 
-                  return Math.floor(Math.random() * (max - min + 1)) + min;
-                };
-
-                const y1 = random(10, 400);
-                const x1 = random(10, 400);
-
-                document.documentElement.dispatchEvent(
-                  new MouseEvent("mousedown", {
-                    view: window,
-                    bubbles: true,
-                    cancelable: true,
-                    clientX: y1,
-                    clientY: x1,
-                    button: 0,
-                  })
-                );
-
-                await new Promise((r) => setTimeout(r, random(150, 300)));
-
-                const y2 = random(y1 - 5, y1 + 5);
-                const x2 = random(x1 - 5, x1 + 5);
-
-                document.documentElement.dispatchEvent(
-                  new MouseEvent("mouseup", {
-                    view: window,
-                    bubbles: true,
-                    cancelable: true,
-                    clientX: y2,
-                    clientY: x2,
-                    button: 0,
-                  })
-                );
-              })
-              .then(r),
-          random(150, 500)
-        )
+    const dataURL = await tab.evaluate(async (image) => {
+      const blob = await fetch(image, { credentials: "include" }).then((res) =>
+        res.blob()
       );
 
-      continue;
-    }
-
-    console.log(`(${slug}) Getting page ${page}`);
-
-    const dataUrl = await tab.evaluate(async (page) => {
-      let canvas: HTMLCanvasElement | null = document.querySelector(
-        "[data-name='PageView'] > canvas"
-      );
-
-      while (!canvas || canvas?.getAttribute("page")) {
-        await new Promise((r) => setTimeout(r, 250));
-        canvas = document.querySelector("[data-name='PageView'] > canvas");
-      }
-
-      canvas.setAttribute("page", page.toString());
-
-      const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r));
-
-      if (!blob) {
-        throw new Error(`Failed to convert canvas to blob for page ${page}`);
-      }
-
-      return new Promise<string>((resolve) => {
+      const result = new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
-        reader.onload = () => resolve(reader.result as string);
+        reader.onloadend = () => resolve(reader.result as string);
+        reader.onerror = reject;
         reader.readAsDataURL(blob);
       });
-    }, page);
 
-    pages.push({ page, url: dataUrl });
+      return result;
+    }, image);
 
-    const res = await fetch(dataUrl);
-    const buffer = await res.arrayBuffer();
-    const img = await sharp(buffer).removeAlpha().png().toBuffer();
+    const path = `scrambled/${page}`;
 
-    console.debug(`Saving page ${page} to ${path}`);
+    console.log(`Saving "${path}"`);
 
-    await Bun.write(path, img);
+    const blob = await fetch(dataURL).then((res) => res.blob());
 
-    await new Promise<void>((r) =>
-      setTimeout(
-        () =>
-          tab
-            .evaluate(async () => {
-              const random = (min: number, max: number) => {
-                min = Math.ceil(min);
-                max = Math.floor(max);
+    await Bun.write(`${downloadDir}/${slug}/${path}`, blob);
 
-                return Math.floor(Math.random() * (max - min + 1)) + min;
-              };
+    downloadedImages.push(filename);
+  }
 
-              const y1 = random(10, 400);
-              const x1 = random(10, 400);
+  if (downloadedImages.length === Object.entries(pageMappings).length) {
+    console.log("Finished getting images");
+  }
 
-              document.documentElement.dispatchEvent(
-                new MouseEvent("mousedown", {
-                  view: window,
-                  bubbles: true,
-                  cancelable: true,
-                  clientX: y1,
-                  clientY: x1,
-                  button: 0,
-                })
-              );
+  const images = await descrambleImages(pageMappings, `${downloadDir}/${slug}`);
 
-              await new Promise((r) => setTimeout(r, random(150, 300)));
+  for (const image of images) {
+    console.debug(`Saving page ${image.page} to ${image.savePath}`);
 
-              const y2 = random(y1 - 5, y1 + 5);
-              const x2 = random(x1 - 5, x1 + 5);
+    await Bun.write(image.savePath, Uint8Array.from(image.content));
 
-              document.documentElement.dispatchEvent(
-                new MouseEvent("mouseup", {
-                  view: window,
-                  bubbles: true,
-                  cancelable: true,
-                  clientX: y2,
-                  clientY: x2,
-                  button: 0,
-                })
-              );
-            })
-            .then(r),
-        random(500, 1250)
-      )
-    );
+    savedPages++;
   }
 
   if (pageData.spreads.length && values.spreads) {
@@ -483,17 +405,21 @@ const downloadGallery = async (slug: string) => {
           .png()
           .toBuffer();
 
-        await Bun.write(path, img);
+        await Bun.write(path, Uint8Array.from(img));
       }
     }
   }
 
   await Bun.write(`${downloadDir}/${slug}/info.yaml`, yaml.stringify(metadata));
 
-  done.add(`https://www.fakku.net/hentai/${slug}`);
-  await Bun.write("done.txt", Array.from(done).join("\n"));
+  if (savedPages === Object.keys(pageData.pages).length) {
+    done.add(`https://www.fakku.net/hentai/${slug}`);
+    await Bun.write("done.txt", Array.from(done).join("\n"));
 
-  console.log(`(${slug}) Finished`);
+    console.log(`(${slug}) Finished`);
+  } else {
+    console.log(`Something failed when downloading ${slug}`);
+  }
 };
 
 for (const slug of slugs) {
