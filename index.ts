@@ -115,7 +115,7 @@ const browser = await puppeteer.launch({
 const tab = await browser.newPage();
 await tab.goto("https://www.fakku.net/login", { waitUntil: "networkidle0" });
 
-if (await tab.$("button[name='login']")) {
+if (await tab.$("a[href='/login/reset']")) {
   console.log('Login then press "Enter" to continue');
 
   for await (const _ of console) {
@@ -292,7 +292,7 @@ const downloadGallery = async (slug: string) => {
     );
 
     await interceptManager.intercept({
-      urlPattern: `*/read`,
+      urlPattern: "*/read",
       resourceType: "XHR",
       modifyResponse({ body, event }) {
         if (body) {
